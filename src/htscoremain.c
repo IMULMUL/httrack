@@ -140,6 +140,97 @@ static void basic_selftests(void) {
   md5selftest();
 }
 
+/* Self-tests for the htssafe.h bounded string ops (driven by httrack -#8).
+   Returns 0 if every bounded operation behaved correctly, 1 otherwise.
+   The abort-on-overflow guarantee is checked separately by the -#8 "overflow"
+   sub-mode (it aborts the process by design). */
+static int string_safety_selftests(void) {
+  char buf[8];
+
+  /* strcpybuff into a sized array: exact copy */
+  strcpybuff(buf, "abc");
+  if (strcmp(buf, "abc") != 0)
+    return 1;
+
+  /* strcatbuff append within capacity */
+  strcatbuff(buf, "de");
+  if (strcmp(buf, "abcde") != 0)
+    return 1;
+
+  /* strncatbuff appends at most N source chars */
+  strcpybuff(buf, "ab");
+  strncatbuff(buf, "cdef", 2);
+  if (strcmp(buf, "abcd") != 0)
+    return 1;
+
+  /* strlcpybuff: explicit-capacity copy into a pointer destination, the form
+     the migration moves toward */
+  {
+    char storage[8];
+    char *const p = storage;
+
+    strlcpybuff(p, "hello", sizeof(storage));
+    if (strcmp(p, "hello") != 0)
+      return 1;
+  }
+
+  /* strcpybuff into a pointer destination: routes through the unchecked
+     strcpybuff_ptr_ fallback (the path the -#8 warning flags). The warning is
+     intentional here; we only verify the fallback still copies correctly. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-warning"
+#endif
+  {
+    char storage[8];
+    char *const p = storage;
+
+    strcpybuff(p, "ptr");
+    if (strcmp(p, "ptr") != 0)
+      return 1;
+  }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+  /* htsbuff: bounded builder over a fixed array (append, truncating append,
+     reset, and length tracking) */
+  {
+    char dst[8];
+    htsbuff b = htsbuff_array(dst);
+
+    htsbuff_cat(&b, "ab");
+    htsbuff_cat(&b, "cd");
+    if (strcmp(htsbuff_str(&b), "abcd") != 0 || b.len != 4)
+      return 1;
+
+    htsbuff_catn(&b, "efghij", 2);      /* append at most 2 */
+    if (strcmp(htsbuff_str(&b), "abcdef") != 0)
+      return 1;
+
+    htsbuff_cpy(&b, "xyz");             /* reset */
+    if (strcmp(htsbuff_str(&b), "xyz") != 0 || b.len != 3)
+      return 1;
+
+    htsbuff_catc(&b, '!'); /* single character */
+    if (strcmp(htsbuff_str(&b), "xyz!") != 0 || b.len != 4)
+      return 1;
+  }
+
+  /* boundary: filling to exactly cap-1 must succeed (one more aborts, which the
+     -#8 overflow-buff mode checks) */
+  {
+    char d2[4];
+    htsbuff c = htsbuff_array(d2);
+
+    htsbuff_cat(&c, "abc");
+    if (strcmp(htsbuff_str(&c), "abc") != 0 || c.len != 3)
+      return 1;
+  }
+
+  return 0;
+}
+
 static int hts_main_internal(int argc, char **argv, httrackp * opt);
 
 // Main, récupère les paramètres et appelle le robot
@@ -294,10 +385,10 @@ static int hts_main_internal(int argc, char **argv, httrackp * opt) {
       /* Vérifier argv[] non vide */
       if (strnotempty(argv[na])) {
 
-        /* Vérifier Commande (alias) */
-        result =
-          optalias_check(argc, (const char *const *) argv, na, &tmp_argc,
-                         (char **) tmp_argv, tmp_error);
+        /* Resolve an option alias, if any */
+        result = optalias_check(argc, (const char *const *) argv, na, &tmp_argc,
+                                (char **) tmp_argv, sizeof(_tmp_argv[0]),
+                                tmp_error, sizeof(tmp_error));
         if (!result) {
           HTS_PANIC_PRINTF(tmp_error);
           htsmain_free();
@@ -1787,10 +1878,6 @@ static int hts_main_internal(int argc, char **argv, httrackp * opt) {
                     HTS_PANIC_PRINTF("Empty string given");
                     htsmain_free();
                     return -1;
-                  } else if (strlen(argv[na]) >= 256) {
-                    HTS_PANIC_PRINTF("Header line string too long");
-                    htsmain_free();
-                    return -1;
                   }
                   StringCat(opt->headers, argv[na]);
                   StringCat(opt->headers, "\r\n");  /* separator */
@@ -2441,6 +2528,35 @@ static int hts_main_internal(int argc, char **argv, httrackp * opt) {
                 htsmain_free();
                 return 0;
                 break;
+              case '8':        /* string-safety selftest: httrack -#8 [overflow <bigstr>] */
+                if (na + 1 < argc
+                    && strncmp(argv[na + 1], "overflow", 8) == 0) {
+                  /* Deliberately exceed a sized buffer: the bounded op must
+                     abort. The source comes from argv so its length is opaque
+                     to the compiler (no static -Wstringop-overflow, genuine
+                     runtime check). "overflow-buff" exercises htsbuff. */
+                  char small[4];
+                  const char *const src =
+                    (na + 2 < argc) ? argv[na + 2] : "overflowing";
+
+                  if (strcmp(argv[na + 1], "overflow-buff") == 0) {
+                    htsbuff b = htsbuff_array(small);
+
+                    htsbuff_cat(&b, src);
+                  } else {
+                    strcpybuff(small, src);
+                  }
+                  printf("strsafe: NOT aborted\n");     /* must be unreachable */
+                  htsmain_free();
+                  return 1;
+                } else {
+                  const int err = string_safety_selftests();
+
+                  printf("strsafe: %s\n", err ? "FAIL" : "OK");
+                  htsmain_free();
+                  return err;
+                }
+                break;
               case '7':  // hashtable selftest: httrack -#7 nb_entries
                 basic_selftests();
                 if (++na < argc) {
@@ -2691,11 +2807,6 @@ static int hts_main_internal(int argc, char **argv, httrackp * opt) {
               return -1;
             } else {
               na++;
-              if (strlen(argv[na]) >= 126) {
-                HTS_PANIC_PRINTF("User-agent length too long");
-                htsmain_free();
-                return -1;
-              }
               StringCopy(opt->user_agent, argv[na]);
               if (StringNotEmpty(opt->user_agent))
                 opt->user_agent_send = 1;
@@ -2899,7 +3010,9 @@ static int hts_main_internal(int argc, char **argv, httrackp * opt) {
   }
 
   {
-    char n_lock[256];
+    /* Sized to the concat-buffer capacity so it can always hold the lock-file
+       path produced by fconcat(), even with a long log path (issue #183). */
+    char n_lock[OPT_GET_BUFF_SIZE(opt)];
 
     // on peut pas avoir un affichage ET un fichier log
     // ca sera pour la version 2

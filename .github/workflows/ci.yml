@@ -1,0 +1,176 @@
+# Build and test on x86-64 and arm64, and lint the shell scripts.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch or PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86-64, runner: ubuntu-24.04, cc: gcc }
+          - { arch: x86-64, runner: ubuntu-24.04, cc: clang }
+          - { arch: arm64, runner: ubuntu-24.04-arm, cc: gcc }
+          - { arch: arm64, runner: ubuntu-24.04-arm, cc: clang }
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang autoconf automake libtool autoconf-archive \
+            zlib1g-dev libssl-dev
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          # autoreconf installs the automake test-driver (not committed) and
+          # validates configure.ac, so "make check" works on a fresh checkout.
+          autoreconf -fi
+          ./configure
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Test
+        run: make check
+
+      - name: Print the test log on failure
+        if: failure()
+        run: cat tests/test-suite.log 2>/dev/null || true
+
+  dco:
+    name: DCO sign-off
+    # Only checkable on a PR, where we have the base..head commit range.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Every commit must be signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          # --no-merges: merge commits are GitHub-generated and carry no sign-off.
+          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if [ -z "$(git log -1 --format='%(trailers:key=Signed-off-by)' "$sha")" ]; then
+              echo "Missing Signed-off-by: $(git log -1 --format='%h %s' "$sha")"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "Sign commits with 'git commit -s'; fix a branch with 'git rebase --signoff $BASE'."
+            echo "See CONTRIBUTING.md (Developer Certificate of Origin)."
+            exit 1
+          fi
+
+  lint:
+    name: lint (shellcheck, shfmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linters
+        env:
+          SHFMT_VERSION: v3.8.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          # shfmt is not packaged in apt; fetch a pinned release binary.
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_$(dpkg --print-architecture)"
+          sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
+
+      # Lint the scripts we maintain; the legacy scripts are a separate cleanup.
+      - name: shellcheck
+        run: shellcheck man/makeman.sh tools/mkdeb.sh .githooks/pre-commit tests/*.test tests/check-network.sh
+
+      - name: shfmt
+        run: shfmt -d -i 4 man/makeman.sh tools/mkdeb.sh .githooks/pre-commit
+
+  # Check clang-format on CHANGED LINES ONLY. The engine predates clang-format
+  # (it was shaped by an old Visual Studio formatter) and does not round-trip,
+  # so we never reformat the whole tree -- only the lines a PR touches.
+  format:
+    name: format (clang-format-19, changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang-format 19 (pinned, from apt.llvm.org)
+        run: |
+          set -euo pipefail
+          # ubuntu-24.04's native clang-format is 18; pin 19 to match local dev.
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format-19
+          # git-clang-format driver, pinned to an immutable release tag (not a
+          # moving branch) since we curl and then execute it.
+          sudo curl -fsSL -o /usr/local/bin/git-clang-format \
+            https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-19.1.7/clang/tools/clang-format/git-clang-format
+          sudo chmod 0755 /usr/local/bin/git-clang-format
+          clang-format-19 --version
+
+      - name: Check formatting of changed lines
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          set +e
+          diff="$(git clang-format --binary clang-format-19 --style=file \
+                    --diff --extensions c,h "$base")"
+          rc=$?
+          set -e
+          # Classify by output first: a non-empty diff means "not clean",
+          # regardless of the driver's exit convention (the release-tag driver
+          # exits 0 and signals via stdout; some packaged drivers exit 1 on a
+          # diff). A nonzero exit with clean output is a real checker error.
+          case "$diff" in
+            "" | "no modified files to format" | *"did not modify any files"*)
+              if [ "$rc" -ne 0 ]; then
+                echo "::error::git clang-format failed (exit $rc): checker error."
+                exit 1
+              fi
+              echo "Formatting OK: changed C lines are clang-format-clean." ;;
+            *)
+              echo "$diff"
+              echo "::error::Changed C lines are not clang-format-clean."
+              echo "Fix locally with: git clang-format --binary clang-format-19 $base"
+              exit 1 ;;
+          esac
